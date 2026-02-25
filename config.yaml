@@ -1,0 +1,15 @@
+# Configuration file for Envoy WASM Error Pages Plugin
+
+# theme controls which error page template to use
+# Available themes:
+#   - cats: HTTP status cats (http.cat images) with minimalist design
+#   - app-down: Application down page with illustrated error graphics
+#   - connection: Connection error page with technical details
+# Default: cats
+theme: connection
+
+# show_details controls whether to display the details table with request information
+# When enabled, shows: Host, Original URI, Request ID, Forwarded For, and Timestamp
+# Set to false to hide all request details
+# Default: true
+show_details: true

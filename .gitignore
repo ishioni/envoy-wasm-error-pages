@@ -1,0 +1,6 @@
+# go output
+*.wasm
+
+# Editor
+.vscode/
+.zed/
