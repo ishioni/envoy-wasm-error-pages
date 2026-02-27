@@ -15,37 +15,56 @@
 package errorpages
 
 import (
+	"fmt"
+	"html"
+	"reflect"
 	"strconv"
 	"strings"
+	"text/template"
 	"time"
 )
 
 // TemplateData holds all the data that can be used in error page templates
 type TemplateData struct {
-	Code         int    // HTTP status code (e.g., 404, 500)
-	Message      string // HTTP status message (e.g., "Not Found", "Internal Server Error")
-	Description  string // Longer description of the error
-	ShowDetails  bool   // Whether to show detailed information
-	Host         string // Request Host header
-	OriginalURI  string // Original request URI
-	ForwardedFor string // X-Forwarded-For header
-	RequestID    string // Request ID for tracing
-	NowUnix      int64  // Current Unix timestamp
-	L10nEnabled  bool   // Whether localization is enabled
-	L10nScript   string // Localization script content
+	Code         int    `token:"code"`
+	Message      string `token:"message"`
+	Description  string `token:"description"`
+	ShowDetails  bool   `token:"show_details"`
+	Host         string `token:"host"`
+	OriginalURI  string `token:"original_uri"`
+	ForwardedFor string `token:"forwarded_for"`
+	RequestID    string `token:"request_id"`
+	NowUnix      int64  // registered as builtin function
+	L10nEnabled  bool   // registered as custom function
+	L10nScript   string // registered as custom function
+}
+
+// Values converts TemplateData fields into a map keyed by their token tags,
+// suitable for registering as template functions.
+func (d *TemplateData) Values() map[string]any {
+	result := make(map[string]any)
+	v := reflect.ValueOf(*d)
+	t := v.Type()
+	for i := 0; i < v.NumField(); i++ {
+		if token, ok := t.Field(i).Tag.Lookup("token"); ok {
+			result[token] = v.Field(i).Interface()
+		}
+	}
+	return result
 }
 
 // Handler manages error page templates and detection
 type Handler struct {
-	template string // Raw template content
-	version  string
+	templateText string // preprocessed template content
+	version      string
 }
 
 // NewWithTemplate creates a handler that uses a Go template for error pages
 func NewWithTemplate(templateBytes []byte, version string) (*Handler, error) {
+	preprocessed := preprocessTemplate(string(templateBytes))
 	return &Handler{
-		template: string(templateBytes),
-		version:  version,
+		templateText: preprocessed,
+		version:      version,
 	}, nil
 }
 
@@ -59,12 +78,9 @@ func IsErrorStatus(status string) bool {
 
 // RenderErrorPage renders the template with the provided data
 func (h *Handler) RenderErrorPage(data *TemplateData) ([]byte, error) {
-	// Set timestamp if not already set
 	if data.NowUnix == 0 {
 		data.NowUnix = time.Now().Unix()
 	}
-
-	// Set message and description based on status code if not provided
 	if data.Message == "" {
 		data.Message = getStatusMessage(data.Code)
 	}
@@ -72,261 +88,134 @@ func (h *Handler) RenderErrorPage(data *TemplateData) ([]byte, error) {
 		data.Description = getStatusDescription(data.Code)
 	}
 
-	// Render the template
-	result := h.renderTemplate(h.template, data)
+	fns := template.FuncMap{
+		"escape":       html.EscapeString,
+		"nowUnix":      func() string { return strconv.FormatInt(data.NowUnix, 10) },
+		"l10n_enabled": func() bool { return data.L10nEnabled },
+		"l10nScript":   func() string { return data.L10nScript },
+		"namespace":    func() string { return "" },
+	}
 
-	// Post-process to remove empty table rows and leftover conditionals
-	result = h.cleanupEmptyRows(result)
+	for k, v := range data.Values() {
+		val := v
+		fns[k] = func() any { return val }
+	}
 
-	return []byte(result), nil
+	tmpl, err := template.New("errorpage").Funcs(fns).Parse(h.templateText)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse template: %w", err)
+	}
+
+	var buf strings.Builder
+	if err := tmpl.Execute(&buf, data); err != nil {
+		return nil, fmt.Errorf("failed to execute template: %w", err)
+	}
+
+	return []byte(buf.String()), nil
 }
 
-// renderTemplate performs simple template rendering with conditionals
-func (h *Handler) renderTemplate(template string, data *TemplateData) string {
-	result := template
+// preprocessTemplate strips HTML/CSS/JS comment wrappers around Go template
+// directives so that text/template can parse them natively. Value expressions
+// like // {{ l10nScript }} are left untouched.
+func preprocessTemplate(raw string) string {
+	lines := strings.Split(raw, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
 
-	// Handle conditional blocks first
-	result = h.processConditionals(result, data)
-
-	// Replace simple variables
-	replacements := map[string]string{
-		"{{ code }}":          strconv.Itoa(data.Code),
-		"{{ message }}":       data.Message,
-		"{{ description }}":   data.Description,
-		"{{ message | escape }}": htmlEscape(data.Message),
-		"{{ description | escape }}": htmlEscape(data.Description),
-		"{{ host }}":          data.Host,
-		"{{ original_uri }}":  data.OriginalURI,
-		"{{ forwarded_for }}": data.ForwardedFor,
-		"{{ request_id }}":    data.RequestID,
-		"{{ nowUnix }}":       strconv.FormatInt(data.NowUnix, 10),
-		"{{ l10nScript }}":    data.L10nScript,
-	}
-
-	for placeholder, value := range replacements {
-		result = strings.ReplaceAll(result, placeholder, value)
-	}
-
-	return result
-}
-
-// processConditionals handles conditional blocks in the template
-func (h *Handler) processConditionals(template string, data *TemplateData) string {
-	result := template
-
-	// Process complex conditional for auto-refresh first
-	shouldAutoRefresh := data.Code == 408 || data.Code == 425 || data.Code == 429 ||
-		data.Code == 500 || data.Code == 502 || data.Code == 503 || data.Code == 504
-	result = h.processComplexRefreshConditional(result, shouldAutoRefresh)
-
-	// Process {{ if show_details }} blocks
-	result = h.processIfBlock(result, "show_details", data.ShowDetails)
-
-	// Process {{ if l10n_enabled }} blocks
-	result = h.processIfBlock(result, "l10n_enabled", data.L10nEnabled)
-
-	return result
-}
-
-// processIfBlock handles simple {{ if condition }} ... {{ end }} blocks with nested conditionals
-func (h *Handler) processIfBlock(template, condition string, show bool) string {
-	result := template
-
-	// Try different comment styles used in the template
-	patterns := []struct {
-		start string
-		end   string
-	}{
-		{"<!-- {{- if " + condition + " -}} -->", "<!-- {{- end -}} -->"},
-		{"<!-- {{ if " + condition + " }} -->", "<!-- {{ end }} -->"},
-		{"<!-- {{- if " + condition + " }} -->", "<!-- {{ end }} -->"},
-		{"<!-- {{ if " + condition + " -}} -->", "<!-- {{- end -}} -->"},
-		{"<!-- {{if " + condition + "}} -->", "<!-- {{end}} -->"},
-		{"<!-- {{- if " + condition + " -}}-->", "<!--{{- end -}}-->"},
-	}
-
-	for _, p := range patterns {
-		startIdx := strings.Index(result, p.start)
-		if startIdx == -1 {
-			continue
-		}
-
-		// Find the matching end marker by counting nesting level
-		searchPos := startIdx + len(p.start)
-		nestLevel := 1
-		endIdx := -1
-
-		for searchPos < len(result) {
-			// Check for nested if statements (but not the chained ones)
-			nextIfIdx := strings.Index(result[searchPos:], "<!-- {{- if ")
-			nextEndIdx := strings.Index(result[searchPos:], p.end)
-
-			// If we find an end before another if (or no if found)
-			if nextEndIdx != -1 && (nextIfIdx == -1 || nextEndIdx < nextIfIdx) {
-				// Check if this is a chained conditional ({{- end }}{{ if)
-				isChained := false
-				if nextEndIdx > 0 {
-					checkPos := searchPos + nextEndIdx
-					if checkPos+len(p.end) < len(result) {
-						afterEnd := result[checkPos+len(p.end) : min(checkPos+len(p.end)+10, len(result))]
-						if strings.HasPrefix(afterEnd, "{{ if ") {
-							isChained = true
-						}
-					}
-				}
-
-				if !isChained {
-					nestLevel--
-					if nestLevel == 0 {
-						endIdx = searchPos + nextEndIdx
-						break
-					}
-				}
-				searchPos += nextEndIdx + len(p.end)
-			} else if nextIfIdx != -1 {
-				// Found a nested if
-				nestLevel++
-				searchPos += nextIfIdx + len("<!-- {{- if ")
-			} else {
-				// No more if or end markers found
-				break
-			}
-		}
-
-		if endIdx == -1 {
-			continue
-		}
-
-		if show {
-			// Remove the conditional markers but keep the content
-			content := result[startIdx+len(p.start) : endIdx]
-			result = result[:startIdx] + content + result[endIdx+len(p.end):]
-		} else {
-			// Remove the entire block
-			result = result[:startIdx] + result[endIdx+len(p.end):]
-		}
-
-		// Process recursively in case there are multiple blocks
-		return h.processIfBlock(result, condition, show)
-	}
-
-	return result
-}
-
-// min returns the minimum of two integers
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// processComplexRefreshConditional handles the auto-refresh meta tag conditional
-func (h *Handler) processComplexRefreshConditional(template string, show bool) string {
-	result := template
-
-	// Look for the refresh meta tag conditional
-	start := "<!-- {{ if or (eq code 408) (eq code 425) (eq code 429) (eq code 500) (eq code 502) (eq code 503) (eq code 504) }} -->"
-	end := "<!-- {{ end }} -->"
-
-	startIdx := strings.Index(result, start)
-	if startIdx == -1 {
-		return result
-	}
-
-	endIdx := strings.Index(result[startIdx:], end)
-	if endIdx == -1 {
-		return result
-	}
-
-	endIdx += startIdx
-
-	if show {
-		// Remove the conditional markers but keep the content
-		content := result[startIdx+len(start) : endIdx]
-		result = result[:startIdx] + content + result[endIdx+len(end):]
-	} else {
-		// Remove the entire block
-		result = result[:startIdx] + result[endIdx+len(end):]
-	}
-
-	return result
-}
-
-// cleanupEmptyRows removes leftover conditional comments and empty table rows
-func (h *Handler) cleanupEmptyRows(html string) string {
-	result := html
-
-	// Remove all conditional comment markers
-	result = strings.ReplaceAll(result, "<!-- {{- if show_details -}} -->", "")
-	result = strings.ReplaceAll(result, "<!-- {{- if host -}} -->", "")
-	result = strings.ReplaceAll(result, "<!-- {{- end }}{{ if original_uri -}} -->", "")
-	result = strings.ReplaceAll(result, "<!-- {{- end }}{{ if forwarded_for -}} -->", "")
-	result = strings.ReplaceAll(result, "<!-- {{- end }}{{ if request_id -}} -->", "")
-	result = strings.ReplaceAll(result, "<!-- {{- end -}} -->", "")
-	result = strings.ReplaceAll(result, "<!-- {{- if l10n_enabled -}} -->", "")
-
-	// Remove table rows with empty values
-	lines := strings.Split(result, "\n")
-	var cleaned []string
-	skipUntilEndTr := false
-
-	for i := 0; i < len(lines); i++ {
-		line := strings.TrimSpace(lines[i])
-
-		// Check if we're starting a table row
-		if strings.Contains(line, "<tr>") {
-			// Look ahead to see if this row has an empty value
-			hasEmptyValue := false
-			for j := i + 1; j < len(lines) && j < i+5; j++ {
-				nextLine := strings.TrimSpace(lines[j])
-				if strings.Contains(nextLine, `<td class="value"></td>`) {
-					hasEmptyValue = true
-					skipUntilEndTr = true
-					break
-				}
-				if strings.Contains(nextLine, "</tr>") {
-					break
-				}
-			}
-			if hasEmptyValue {
+		// HTML comment wrapper: <!-- {{...}} -->
+		if strings.HasPrefix(trimmed, "<!--") && strings.HasSuffix(trimmed, "-->") {
+			inner := strings.TrimPrefix(trimmed, "<!--")
+			inner = strings.TrimSuffix(inner, "-->")
+			inner = strings.TrimSpace(inner)
+			if containsOnlyDirectives(inner) {
+				lines[i] = ensureOuterTrimMarkers(inner)
 				continue
 			}
 		}
 
-		// If we're skipping an empty row, skip until we find </tr>
-		if skipUntilEndTr {
-			if strings.Contains(line, "</tr>") {
-				skipUntilEndTr = false
+		// CSS comment wrapper: /* {{...}} */
+		if strings.HasPrefix(trimmed, "/*") && strings.HasSuffix(trimmed, "*/") {
+			inner := strings.TrimPrefix(trimmed, "/*")
+			inner = strings.TrimSuffix(inner, "*/")
+			inner = strings.TrimSpace(inner)
+			if containsOnlyDirectives(inner) {
+				lines[i] = ensureOuterTrimMarkers(inner)
+				continue
 			}
-			continue
 		}
 
-		// Keep this line
-		cleaned = append(cleaned, lines[i])
+		// JS line comment wrapper: // {{...}}
+		if strings.HasPrefix(trimmed, "//") && !strings.HasPrefix(trimmed, "///") {
+			inner := strings.TrimPrefix(trimmed, "//")
+			inner = strings.TrimSpace(inner)
+			if containsOnlyDirectives(inner) {
+				lines[i] = ensureOuterTrimMarkers(inner)
+				continue
+			}
+		}
 	}
-
-	return strings.Join(cleaned, "\n")
+	return strings.Join(lines, "\n")
 }
 
-// htmlEscape escapes HTML special characters
-func htmlEscape(s string) string {
-	replacements := []struct {
-		old string
-		new string
-	}{
-		{"&", "&amp;"},
-		{"<", "&lt;"},
-		{">", "&gt;"},
-		{`"`, "&quot;"},
-		{"'", "&#39;"},
+// containsOnlyDirectives checks whether s consists entirely of Go template
+// actions ({{ ... }}) containing control-flow keywords, with only whitespace
+// between them.
+func containsOnlyDirectives(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
 	}
 
-	result := s
-	for _, r := range replacements {
-		result = strings.ReplaceAll(result, r.old, r.new)
+	remaining := s
+	found := false
+	for len(remaining) > 0 {
+		idx := strings.Index(remaining, "{{")
+		if idx == -1 {
+			return found && strings.TrimSpace(remaining) == ""
+		}
+		if strings.TrimSpace(remaining[:idx]) != "" {
+			return false
+		}
+		endIdx := strings.Index(remaining[idx:], "}}")
+		if endIdx == -1 {
+			return false
+		}
+
+		action := remaining[idx+2 : idx+endIdx]
+		action = strings.Trim(action, "- ")
+		action = strings.TrimSpace(action)
+
+		if !isControlKeyword(action) {
+			return false
+		}
+
+		remaining = remaining[idx+endIdx+2:]
+		found = true
 	}
-	return result
+	return found
+}
+
+var controlKeywords = []string{"if ", "else if ", "else", "end", "range ", "with ", "block ", "define ", "template "}
+
+func isControlKeyword(action string) bool {
+	for _, kw := range controlKeywords {
+		if action == strings.TrimSpace(kw) || strings.HasPrefix(action, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// ensureOuterTrimMarkers ensures the first {{ and last }} in the string have
+// whitespace-trimming markers ({{- and -}}).
+func ensureOuterTrimMarkers(s string) string {
+	if strings.HasPrefix(s, "{{") && !strings.HasPrefix(s, "{{-") {
+		s = "{{- " + strings.TrimLeft(s[2:], " ")
+	}
+	if strings.HasSuffix(s, "}}") && !strings.HasSuffix(s, "-}}") {
+		s = strings.TrimRight(s[:len(s)-2], " ") + " -}}"
+	}
+	return s
 }
 
 // getStatusMessage returns the standard HTTP status message for a code
@@ -381,7 +270,6 @@ func getStatusMessage(code int) string {
 		return msg
 	}
 
-	// Fallback for unknown codes
 	if code >= 400 && code < 500 {
 		return "Client Error"
 	}
@@ -408,7 +296,6 @@ func getStatusDescription(code int) string {
 		return desc
 	}
 
-	// Generic descriptions
 	if code >= 400 && code < 500 {
 		return "An error occurred while processing your request."
 	}

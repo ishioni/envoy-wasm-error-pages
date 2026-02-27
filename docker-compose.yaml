@@ -13,7 +13,7 @@ services:
 
   # Debug HTTP backend that returns various status codes
   http-debug:
-    image: ghcr.io/ishioni/http-debug:0.0.2
+    image: ghcr.io/ishioni/http-debug:0.0.3
     container_name: http-debug
     ports:
       - "8080:8080"
